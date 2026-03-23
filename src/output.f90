@@ -11,7 +11,7 @@ module mod_output
   use mod_types
   implicit none
   private
-  public out0d,gen_alias,out1d,out1d_chan,out2d,out3d,write_log_output,write_visu_2d,write_visu_3d
+  public out0d,gen_alias,out1d,out1d_chan,out1d_chan_temp,out2d,out3d,write_log_output,write_visu_2d,write_visu_3d
   character(len=*), parameter :: fmt_dp = '(*(es24.16e3,1x))', &
                                  fmt_sp = '(*(es15.8e2,1x))'
 #if !defined(_SINGLE_PRECISION)
@@ -375,6 +375,90 @@ module mod_output
     case(1)
     end select
   end subroutine out1d_chan
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  ! Statistics for channel with temperature (implemented by mchba). Only valid for channel with streamwise dir in x (idir=3).
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  subroutine out1d_chan_temp(fname,ng,lo,hi,idir,l,dl,z_g,u,v,w,th) 
+    implicit none
+    character(len=*), intent(in) :: fname
+    integer , intent(in), dimension(3) :: ng,lo,hi
+    integer , intent(in) :: idir
+    real(rp), intent(in), dimension(3) :: l,dl
+    real(rp), intent(in), dimension(0:) :: z_g
+    real(rp), intent(in), dimension(lo(1)-1:,lo(2)-1:,lo(3)-1:) :: u,v,w,th
+    real(rp), allocatable, dimension(:) :: um,vm,wm,u2,v2,w2,uw,thm,th2,wth
+    integer :: i,j,k
+    integer :: iunit
+    integer :: q
+    real(rp) :: grid_area_ratio
+    !
+    q = ng(idir)
+    select case(idir)
+    case(3)
+      grid_area_ratio = dl(1)*dl(2)/(l(1)*l(2))
+      allocate(um(0:q+1),vm(0:q+1),wm(0:q+1),u2(0:q+1),v2(0:q+1),w2(0:q+1),uw(0:q+1),thm(0:q+1),th2(0:q+1),wth(0:q+1))
+      um(:) = 0.
+      vm(:) = 0.
+      wm(:) = 0.
+      u2(:) = 0.
+      v2(:) = 0.
+      w2(:) = 0.
+      uw(:) = 0.
+      thm(:) = 0.
+      th2(:) = 0.
+      wth(:) = 0.
+      do k=lo(3),hi(3)
+        do j=lo(2),hi(2)
+          do i=lo(1),hi(1)
+            um(k) = um(k) + u(i,j,k)
+            vm(k) = vm(k) + v(i,j,k)
+            wm(k) = wm(k) + 0.50*(w(i,j,k-1) + w(i,j,k))
+            u2(k) = u2(k) + u(i,j,k)**2
+            v2(k) = v2(k) + v(i,j,k)**2
+            w2(k) = w2(k) + 0.50*(w(i,j,k)**2+w(i,j,k-1)**2)
+            uw(k) = uw(k) + 0.25*(u(i-1,j,k) + u(i,j,k))* &
+                                 (w(i,j,k-1) + w(i,j,k))
+            thm(k) = thm(k) + th(i,j,k)
+            th2(k) = th2(k) + th(i,j,k)**2
+            wth(k) = wth(k) + 0.5*(w(i,j,k-1) + w(i,j,k)) * th(i,j,k) ! I assume that temperature is stored at the cell center. 
+          end do
+        end do
+      end do
+      call MPI_ALLREDUCE(MPI_IN_PLACE,um(1),ng(3),MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,vm(1),ng(3),MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,wm(1),ng(3),MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,u2(1),ng(3),MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,v2(1),ng(3),MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,w2(1),ng(3),MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,uw(1),ng(3),MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,thm(1),ng(3),MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,th2(1),ng(3),MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
+      call MPI_ALLREDUCE(MPI_IN_PLACE,wth(1),ng(3),MPI_REAL_RP,MPI_SUM,MPI_COMM_WORLD,ierr)
+      um(:) = um(:)*grid_area_ratio
+      vm(:) = vm(:)*grid_area_ratio
+      wm(:) = wm(:)*grid_area_ratio
+      u2(:) = u2(:)*grid_area_ratio - um(:)**2
+      v2(:) = v2(:)*grid_area_ratio - vm(:)**2
+      w2(:) = w2(:)*grid_area_ratio - wm(:)**2
+      uw(:) = uw(:)*grid_area_ratio - um(:)*wm(:)
+      thm(:) = thm(:)*grid_area_ratio
+      th2(:) = th2(:)*grid_area_ratio - thm(:)**2
+      wth(:) = wth(:)*grid_area_ratio - wm(:)*thm(:)
+      if(myid == 0) then
+        open(newunit=iunit,file=fname)
+        do k=1,ng(3)
+          write(iunit,fmt_rp) z_g(k),um(k),vm(k),wm(k), &
+                                     u2(k),v2(k),w2(k), &
+                                     uw(k),thm(k),th2(k),wth(k)
+        end do
+        close(iunit)
+      end if
+    case(2)
+    case(1)
+    end select
+  end subroutine out1d_chan_temp
+  !
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
   !
   subroutine out2d_duct(fname,ng,lo,hi,idir,l,dl,z_g,u,v,w) ! e.g. for a duct
     !
